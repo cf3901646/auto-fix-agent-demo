@@ -1,6 +1,9 @@
 name: Auto Fix Bug & Open PR
 
 on:
+  schedule:
+    # 定时任务：每天 UTC 02:00（北京时间 10:00）自动扫描并修复未解决的 Bug Issue
+    - cron: '0 2 * * *'
   issues:
     types: [labeled]
   issue_comment:
@@ -8,9 +11,10 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: 'Issue number to fix'
-        required: true
-        type: number
+        description: 'Target Issue number to fix (Leave blank to run in cron-batch mode across all open issues)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -22,7 +26,8 @@ jobs:
     if: >-
       (github.event_name == 'issues' && github.event.label.name == 'auto-fix') ||
       (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/fix')) ||
-      (github.event_name == 'workflow_dispatch')
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'schedule')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -41,15 +46,6 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine Issue Number
-        id: get_issue
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "issue_num=${{ inputs.issue_number }}" >> $GITHUB_OUTPUT
-          else
-            echo "issue_num=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Run Auto-Fix Agent
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -57,4 +53,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python scripts/auto_fix_pr.py --issue ${{ steps.get_issue.outputs.issue_num }}
+          if [ "${{ github.event_name }}" = "schedule" ] || [ -z "${{ inputs.issue_number }}" -a "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "[*] Triggered via schedule or batch dispatch. Processing pending issues..."
+            python scripts/auto_fix_pr.py --cron-batch
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "[*] Triggered via workflow_dispatch for Issue #${{ inputs.issue_number }}"
+            python scripts/auto_fix_pr.py --issue ${{ inputs.issue_number }}
+          else
+            echo "[*] Triggered via Issue #${{ github.event.issue.number }}"
+            python scripts/auto_fix_pr.py --issue ${{ github.event.issue.number }}
+          fi
