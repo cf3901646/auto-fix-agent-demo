@@ -139,6 +139,27 @@ def search_candidate_issues(token, query, limit=10):
         return data.get("items", [])
 
 
+def search_top_repos(token, min_stars=1000, limit=20):
+    """Search for popular, actively updated Python repositories with > min_stars."""
+    opener = get_opener()
+    url = f"https://api.github.com/search/repositories?q=language:python+stars:>{min_stars}&sort=updated&order=desc&per_page={limit}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "OpenSourceBugHunter"
+        }
+    )
+    try:
+        with opener.open(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return [item["full_name"] for item in data.get("items", [])]
+    except Exception as e:
+        print(f"[!] Error querying top repos: {e}")
+        return []
+
+
 def get_repo_stars(repo_full_name, gh_token):
     """Retrieve star count for repository."""
     try:
@@ -529,31 +550,31 @@ def main():
                 print(f"[!] Error fetching issues from {r}: {e}")
     else:
         min_stars = args.min_stars
-        print(f"[*] Searching GitHub for open-source issues across popular projects (stars > {min_stars})...")
-        if args.query:
-            base_q = args.query
-            if "stars:" not in base_q:
-                base_q = f"{base_q} stars:>{min_stars}"
-            queries = [base_q]
-        else:
-            queries = [
-                f'is:open is:issue language:python stars:>{min_stars} label:"good first issue"',
-                f'is:open is:issue language:python stars:>{min_stars} label:bug',
-                f'is:open is:issue language:python stars:>{min_stars} label:"help wanted"'
-            ]
+        print(f"[*] Discovering active open-source repositories with stars > {min_stars}...")
+        top_repos = search_top_repos(gh_token, min_stars=min_stars, limit=20)
+        curated = [
+            "deepset-ai/haystack", "pallets/werkzeug", "encode/httpx", "pallets/flask",
+            "pydantic/pydantic", "tiangolo/fastapi", "urllib3/urllib3", "bottlepy/bottle"
+        ]
+        target_pool = list(dict.fromkeys(top_repos + curated))
+        print(f"[*] Monitoring repository pool ({len(target_pool)} repos): {', '.join(target_pool[:6])}...")
+
         seen_urls = set()
-        for q in queries:
-            print(f"[*] Executing search query: {q}")
+        for r in target_pool:
+            if any(exc.lower() in r.lower() for exc in args.exclude):
+                continue
             try:
-                items = search_candidate_issues(gh_token, q, limit=15)
+                items_raw = run_cmd(["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "5", "--json", "number,title,body,repository,url"])
+                items = json.loads(items_raw)
                 for item in items:
-                    u = item.get("html_url") or item.get("url")
-                    if u and u not in seen_urls:
+                    item["repository_url"] = f"https://api.github.com/repos/{r}"
+                    u = item.get("url") or f"{r}#{item.get('number')}"
+                    if u not in seen_urls:
                         seen_urls.add(u)
                         candidates.append(item)
             except Exception as e:
-                print(f"[!] Search query error: {e}")
-            if len(candidates) >= 20:
+                pass
+            if len(candidates) >= 25:
                 break
 
     print(f"[*] Found {len(candidates)} candidate issues. Filtering for actionable bugs in repositories with > {args.min_stars} stars...")
