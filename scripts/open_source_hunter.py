@@ -126,14 +126,13 @@ def search_candidate_issues(token, query, limit=10):
     opener = get_opener()
     encoded_q = urllib.parse.quote(query)
     url = f"https://api.github.com/search/issues?q={encoded_q}&sort=updated&order=desc&per_page={limit}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "OpenSourceBugHunter"
-        }
-    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "OpenSourceBugHunter"
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     with opener.open(req) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         return data.get("items", [])
@@ -143,14 +142,13 @@ def search_top_repos(token, min_stars=1000, limit=20):
     """Search for popular, actively updated Python repositories with > min_stars."""
     opener = get_opener()
     url = f"https://api.github.com/search/repositories?q=language:python+stars:>{min_stars}&sort=updated&order=desc&per_page={limit}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "OpenSourceBugHunter"
-        }
-    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "OpenSourceBugHunter"
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     try:
         with opener.open(req) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -540,7 +538,7 @@ def main():
     if args.repos:
         for r in args.repos:
             try:
-                cmd = f'gh issue list --repo {r} --state open --limit 5 --json number,title,body,repository,url'
+                cmd = ["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "5", "--json", "number,title,body,url,labels"]
                 raw = run_cmd(cmd)
                 items = json.loads(raw)
                 for item in items:
@@ -564,7 +562,8 @@ def main():
             if any(exc.lower() in r.lower() for exc in args.exclude):
                 continue
             try:
-                items_raw = run_cmd(["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "5", "--json", "number,title,body,repository,url"])
+                cmd = ["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "5", "--json", "number,title,body,url,labels"]
+                items_raw = run_cmd(cmd)
                 items = json.loads(items_raw)
                 for item in items:
                     item["repository_url"] = f"https://api.github.com/repos/{r}"
@@ -573,7 +572,7 @@ def main():
                         seen_urls.add(u)
                         candidates.append(item)
             except Exception as e:
-                pass
+                print(f"[!] Error fetching issues from {r}: {e}")
             if len(candidates) >= 25:
                 break
 
