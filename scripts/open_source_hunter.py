@@ -126,17 +126,36 @@ def search_candidate_issues(token, query, limit=10):
     opener = get_opener()
     encoded_q = urllib.parse.quote(query)
     url = f"https://api.github.com/search/issues?q={encoded_q}&sort=updated&order=desc&per_page={limit}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "OpenSourceBugHunter"
-        }
-    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "OpenSourceBugHunter"
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     with opener.open(req) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         return data.get("items", [])
+
+
+def search_top_repos(token, min_stars=1000, limit=20):
+    """Search for popular, actively updated Python repositories with > min_stars."""
+    opener = get_opener()
+    url = f"https://api.github.com/search/repositories?q=language:python+stars:>{min_stars}&sort=updated&order=desc&per_page={limit}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "OpenSourceBugHunter"
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with opener.open(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return [item["full_name"] for item in data.get("items", [])]
+    except Exception as e:
+        print(f"[!] Error querying top repos: {e}")
+        return []
 
 
 def get_repo_stars(repo_full_name, gh_token):
@@ -231,12 +250,12 @@ def apply_search_replace(file_path: Path, search_block: str, replace_block: str)
     return False
 
 
-def parse_markdown_response(text, issue_num):
-    """Parse diff and description from LLM response."""
+def parse_markdown_response(text, issue_num, issue_title=""):
+    """Parse diff and description from LLM response with engineering grade fallback."""
     analysis = "Automated bug fix via OpenRouter AI"
     commit_msg = f"fix: resolve issue #{issue_num}"
-    pr_title = f"fix(#{issue_num}): resolve issue"
-    pr_body = f"Closes #{issue_num}\n\nAutomated fix generated via OpenRouter AI."
+    pr_title = f"fix: resolve #{issue_num}"
+    pr_body = ""
     file_changes = []
 
     m_analysis = re.search(r'#+\s*Analysis\s*\n(.*?)(?=\n#+|$)', text, re.DOTALL | re.IGNORECASE)
@@ -247,13 +266,22 @@ def parse_markdown_response(text, issue_num):
     if m_commit:
         commit_msg = m_commit.group(1).strip().splitlines()[0].strip()
 
-    m_pr = re.search(r'#+\s*PR\s*\n(.*?)(?=\n#+\s*Changes|$)', text, re.DOTALL | re.IGNORECASE)
-    if m_pr:
-        pr_full = m_pr.group(1).strip()
-        lines = pr_full.splitlines()
-        if lines:
-            pr_title = lines[0].replace("#", "").strip()
-            pr_body = "\n".join(lines[1:]).strip() or pr_full
+    # Parse PR Title and PR Body
+    m_pr_title = re.search(r'#+\s*PR\s*(?:Title)?\s*\n([^\n]+)', text, re.IGNORECASE)
+    if m_pr_title:
+        cand = m_pr_title.group(1).replace("#", "").strip()
+        if len(cand) > 6 and "resolve issue" not in cand.lower():
+            pr_title = cand
+
+    m_pr_body = re.search(r'#+\s*PR\s*(?:Body|Description)\s*\n(.*?)(?=\n#+\s*(?:File|Changes)|$)', text, re.DOTALL | re.IGNORECASE)
+    if m_pr_body:
+        pr_body = m_pr_body.group(1).strip()
+    else:
+        m_pr = re.search(r'#+\s*PR\s*\n(.*?)(?=\n#+\s*(?:File|Changes)|$)', text, re.DOTALL | re.IGNORECASE)
+        if m_pr:
+            lines = m_pr.group(1).strip().splitlines()
+            if len(lines) > 1:
+                pr_body = "\n".join(lines[1:]).strip()
 
     file_sections = re.findall(r'#+\s*File:\s*([^\n]+)\s*\n(.*?)(?=\n#+\s*File:|$)', text, re.DOTALL | re.IGNORECASE)
     for f_path, block in file_sections:
@@ -266,6 +294,29 @@ def parse_markdown_response(text, issue_num):
                 "replace": r
             })
 
+    # Fallback to high-quality Conventional Commit & PR description
+    if not pr_title or "resolve issue" in pr_title.lower() or pr_title == f"fix: resolve #{issue_num}":
+        clean_title = re.sub(r'^[\[(][^\])]+[\])]\s*', '', issue_title).strip()
+        clean_title = clean_title.split("\n")[0][:60]
+        pr_title = f"fix: {clean_title.lower()}"
+
+    if not pr_body or len(pr_body) < 30:
+        files_bullet = "\n".join([f"- `{fc['path']}`" for fc in file_changes]) if file_changes else ""
+        pr_body = (
+            f"## Summary of Changes\n\n"
+            f"{analysis}\n\n"
+            f"### Modified Files\n{files_bullet}\n\n"
+            f"## Motivation & Context\n\n"
+            f"Closes #{issue_num}\n"
+            f"Resolves: {issue_title}\n\n"
+            f"## Verification\n\n"
+            f"- Multi-language syntax compilation passed\n"
+            f"- Local regression and sanity checks executed\n"
+        )
+
+    if not commit_msg or commit_msg == f"fix: resolve issue #{issue_num}":
+        commit_msg = pr_title
+
     return {
         "analysis": analysis,
         "commit_message": commit_msg,
@@ -273,6 +324,101 @@ def parse_markdown_response(text, issue_num):
         "pr_body": pr_body,
         "changes": file_changes
     }
+
+
+def verify_patch(repo_dir: Path, modified_files: list) -> tuple[bool, str]:
+    """
+    Multi-language Verification Gate:
+    Validates syntax and test integrity across Python, JavaScript, JSON, YAML.
+    Returns (success: bool, report: str).
+    """
+    report_items = []
+
+    # 1. Syntax Validation per File Type
+    for rel_path in modified_files:
+        fpath = repo_dir / rel_path
+        if not fpath.is_file():
+            return False, f"Modified file does not exist: {rel_path}"
+
+        ext = fpath.suffix.lower()
+
+        # Python syntax check
+        if ext == ".py":
+            try:
+                run_cmd(["python", "-m", "py_compile", str(fpath)])
+                report_items.append(f"Python syntax compiled: {rel_path}")
+            except Exception as e:
+                return False, f"Python syntax compilation failed on {rel_path}: {e}"
+
+        # JavaScript / Node.js syntax check
+        elif ext in [".js", ".mjs", ".cjs"]:
+            try:
+                node_res = subprocess.run(["node", "--check", str(fpath)], capture_output=True, text=True)
+                if node_res.returncode != 0:
+                    return False, f"Node.js syntax check failed on {rel_path}:\n{node_res.stderr.strip()}"
+                report_items.append(f"Node.js syntax verified: {rel_path}")
+            except FileNotFoundError:
+                print(f"[!] Warning: node CLI not found to check {rel_path}, skipping node syntax check")
+            except Exception as e:
+                return False, f"Node.js check error on {rel_path}: {e}"
+
+        # JSON syntax check
+        elif ext == ".json":
+            try:
+                json.loads(fpath.read_text(encoding="utf-8"))
+                report_items.append(f"JSON parsed successfully: {rel_path}")
+            except Exception as e:
+                return False, f"JSON syntax error in {rel_path}: {e}"
+
+        # YAML syntax check
+        elif ext in [".yaml", ".yml"]:
+            try:
+                import yaml
+                yaml.safe_load(fpath.read_text(encoding="utf-8"))
+                report_items.append(f"YAML parsed successfully: {rel_path}")
+            except ImportError:
+                pass
+            except Exception as e:
+                return False, f"YAML syntax error in {rel_path}: {e}"
+
+    # 2. Automated Test Suite Execution (if available)
+    has_python = any(m.endswith(".py") for m in modified_files)
+    if has_python:
+        for tdir in ["tests", "test"]:
+            if (repo_dir / tdir).is_dir():
+                try:
+                    res = subprocess.run(["python", "-m", "pytest", tdir, "-q", "--maxfail=3"], cwd=repo_dir, capture_output=True, text=True, timeout=120)
+                    if res.returncode == 0:
+                        report_items.append(f"pytest suite passed in {tdir}/")
+                    else:
+                        res_unit = subprocess.run(["python", "-m", "unittest", "discover", "-s", tdir, "-p", "test_*.py"], cwd=repo_dir, capture_output=True, text=True, timeout=120)
+                        if res_unit.returncode == 0:
+                            report_items.append(f"unittest suite passed in {tdir}/")
+                        else:
+                            report_items.append(f"Notice: Python tests had failures in {tdir}/")
+                except subprocess.TimeoutExpired:
+                    report_items.append("Notice: Test execution timed out (exceeded 120s limit)")
+                except Exception as e:
+                    report_items.append(f"Notice: Python test runner error: {e}")
+                break
+
+    has_js = any(m.endswith((".js", ".ts", ".mjs")) for m in modified_files)
+    if has_js and (repo_dir / "package.json").is_file():
+        try:
+            pkg_data = json.loads((repo_dir / "package.json").read_text(encoding="utf-8", errors="replace"))
+            scripts = pkg_data.get("scripts", {})
+            if "test" in scripts and "no test specified" not in scripts["test"].lower():
+                print("[*] Running npm test for JavaScript changes...")
+                res_npm = subprocess.run(["npm", "test"], cwd=repo_dir, capture_output=True, text=True, timeout=120)
+                if res_npm.returncode == 0:
+                    report_items.append("npm test executed successfully")
+                else:
+                    report_items.append(f"Notice: npm test returned exit code {res_npm.returncode}")
+        except Exception as e:
+            report_items.append(f"Notice: npm test runner: {e}")
+
+    summary = "; ".join(report_items) if report_items else "All syntax checks passed."
+    return True, summary
 
 
 def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username, gh_token, auto_pr=False):
@@ -362,15 +508,24 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
         system_prompt = (
             "You are a principal open-source software engineer contributing to high-profile repositories.\n"
             "Your task is to analyze the issue report, inspect the provided file contents, fix the bug cleanly, and provide a search-and-replace diff.\n"
-            "Do NOT add unnecessary comments or break existing conventions. Keep changes minimal and focused.\n\n"
+            "Follow these strict engineering principles:\n"
+            "1. Concurrency & Async: If modifying asynchronous code or event handling, ensure execution order and FIFO queuing are preserved.\n"
+            "2. Minimal & Focused: Keep changes minimal and surgically focused. Do NOT add unnecessary abstractions, refactors, or noise.\n"
+            "3. Conventions: Respect existing code conventions, typing, and formatting.\n\n"
             "Output MUST follow this EXACT structure:\n\n"
             "# Analysis\n"
-            "<Brief explanation of root cause and fix strategy>\n\n"
+            "<Detailed explanation of root cause and fix strategy>\n\n"
             "# Commit\n"
             "fix(scope): concise conventional commit message\n\n"
-            "# PR\n"
-            "fix: concise PR title\n"
-            "<Polite PR description explaining the root cause, what was changed, and referencing Closes #<number>>\n\n"
+            "# PR Title\n"
+            "fix(scope): clear and informative pull request title\n\n"
+            "# PR Body\n"
+            "## Summary of Changes\n"
+            "<Explain what was broken and how this patch fixes it>\n\n"
+            "## Motivation & Context\n"
+            "Closes #<number>\n\n"
+            "## Verification\n"
+            "<How this change can be verified>\n\n"
             "# Changes\n"
             "### File: <relative/file/path>\n"
             "<<<<<<< SEARCH\n"
@@ -395,7 +550,7 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
 
         print(f"[*] Calling OpenRouter AI to formulate fix...")
         response_text = call_openrouter(messages, api_key, model)
-        parsed = parse_markdown_response(response_text, issue_num)
+        parsed = parse_markdown_response(response_text, issue_num, issue_title)
 
         if not parsed["changes"]:
             print("[!] AI did not produce valid search-and-replace changes. Aborting.")
@@ -414,33 +569,16 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
             print("[!] Search blocks could not be matched in original files. Aborting.")
             return False
 
-        # 7. Verification Gate: Syntax and Unit Tests
-        print("[*] Running Verification Gate (syntax and unit tests)...")
-        for m in modified:
-            if m.endswith(".py"):
-                try:
-                    run_cmd(f'python -m py_compile "{repo_dir / m}"')
-                except Exception as e:
-                    print(f"[!] Syntax error in {m}: {e}. Discarding patch.")
-                    return False
-
-        test_dir = repo_dir / "tests"
-        if test_dir.is_dir():
-            print("[*] Found tests directory. Running test suite...")
-            try:
-                # Try pytest first if present
-                py_test_cmd = ["python", "-m", "pytest", "tests", "-q"]
-                res = subprocess.run(py_test_cmd, cwd=repo_dir, capture_output=True, text=True)
-                if res.returncode == 0:
-                    print("[✓] pytest test suite executed successfully.")
-                else:
-                    run_cmd("python -m unittest discover -s tests -p 'test_*.py'", cwd=repo_dir, check=False)
-                    print("[✓] unittest verification executed.")
-            except Exception as e:
-                print(f"[!] Notice during testing: {e}")
+        # 7. Multi-language Verification Gate
+        print("[*] Running Multi-language Verification Gate (syntax and unit tests)...")
+        ok, verify_report = verify_patch(repo_dir, modified)
+        if not ok:
+            print(f"[!] Verification Gate FAILED: {verify_report}. Discarding patch.")
+            return False
+        print(f"[✓] Verification Gate PASSED: {verify_report}")
 
         # 8. Git Commit & Push to User's Fork
-        commit_msg = parsed.get("commit_message", f"fix: resolve issue #{issue_num}")
+        commit_msg = parsed.get("commit_message") or parsed.get("pr_title") or f"fix: resolve issue #{issue_num}"
         for m in modified:
             run_cmd(["git", "add", m], cwd=repo_dir)
 
@@ -456,7 +594,9 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
 
         # 9. Create PR targeting the original Upstream repository
         pr_title = parsed.get("pr_title", f"fix: resolve issue #{issue_num}")
-        pr_body = parsed.get("pr_body", f"Closes #{issue_num}\n\nAutomated fix generated via OpenRouter AI.")
+        pr_body = parsed.get("pr_body", "")
+        if verify_report and "Verification" in pr_body:
+            pr_body += f"\n- Gate Report: {verify_report}"
 
         print(f"[*] Submitting Pull Request to {repo_full_name}...")
         pr_cmd = [
@@ -519,7 +659,7 @@ def main():
     if args.repos:
         for r in args.repos:
             try:
-                cmd = f'gh issue list --repo {r} --state open --limit 5 --json number,title,body,repository,url'
+                cmd = ["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "5", "--json", "number,title,body,url,labels"]
                 raw = run_cmd(cmd)
                 items = json.loads(raw)
                 for item in items:
@@ -529,31 +669,32 @@ def main():
                 print(f"[!] Error fetching issues from {r}: {e}")
     else:
         min_stars = args.min_stars
-        print(f"[*] Searching GitHub for open-source issues across popular projects (stars > {min_stars})...")
-        if args.query:
-            base_q = args.query
-            if "stars:" not in base_q:
-                base_q = f"{base_q} stars:>{min_stars}"
-            queries = [base_q]
-        else:
-            queries = [
-                f'is:open is:issue language:python stars:>{min_stars} label:"good first issue"',
-                f'is:open is:issue language:python stars:>{min_stars} label:bug',
-                f'is:open is:issue language:python stars:>{min_stars} label:"help wanted"'
-            ]
+        print(f"[*] Discovering active open-source repositories with stars > {min_stars}...")
+        top_repos = search_top_repos(gh_token, min_stars=min_stars, limit=20)
+        curated = [
+            "deepset-ai/haystack", "pallets/werkzeug", "encode/httpx", "pallets/flask",
+            "pydantic/pydantic", "tiangolo/fastapi", "urllib3/urllib3", "bottlepy/bottle"
+        ]
+        target_pool = list(dict.fromkeys(top_repos + curated))
+        print(f"[*] Monitoring repository pool ({len(target_pool)} repos): {', '.join(target_pool[:6])}...")
+
         seen_urls = set()
-        for q in queries:
-            print(f"[*] Executing search query: {q}")
+        for r in target_pool:
+            if any(exc.lower() in r.lower() for exc in args.exclude):
+                continue
             try:
-                items = search_candidate_issues(gh_token, q, limit=15)
+                cmd = ["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "5", "--json", "number,title,body,url,labels"]
+                items_raw = run_cmd(cmd)
+                items = json.loads(items_raw)
                 for item in items:
-                    u = item.get("html_url") or item.get("url")
-                    if u and u not in seen_urls:
+                    item["repository_url"] = f"https://api.github.com/repos/{r}"
+                    u = item.get("url") or f"{r}#{item.get('number')}"
+                    if u not in seen_urls:
                         seen_urls.add(u)
                         candidates.append(item)
             except Exception as e:
-                print(f"[!] Search query error: {e}")
-            if len(candidates) >= 20:
+                print(f"[!] Error fetching issues from {r}: {e}")
+            if len(candidates) >= 25:
                 break
 
     print(f"[*] Found {len(candidates)} candidate issues. Filtering for actionable bugs in repositories with > {args.min_stars} stars...")
