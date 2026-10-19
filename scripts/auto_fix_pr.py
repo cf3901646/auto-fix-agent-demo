@@ -299,44 +299,13 @@ def apply_search_replace(file_path: Path, search_block: str, replace_block: str)
     return False
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Auto-fix GitHub Issues and create PRs using OpenRouter AI")
-    parser.add_argument("--issue", type=int, help="Target Issue number to fix")
-    parser.add_argument("--repo", type=str, help="GitHub repo (e.g. owner/repo). Defaults to GITHUB_REPOSITORY or current repo")
-    parser.add_argument("--files", nargs="*", help="Specific files related to this bug")
-    parser.add_argument("--model", type=str, default=None, help="OpenRouter model (default from env or fallback list)")
-    parser.add_argument("--dry-run", action="store_true", help="Only generate fix without committing or pushing PR")
-    parser.add_argument("--list", action="store_true", help="List open issues in the repository")
-    args = parser.parse_args()
-
-    # Load .env
-    root_dir = Path(__file__).resolve().parent.parent
-    load_env(root_dir / ".env")
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        print("[Error] OPENROUTER_API_KEY not found in environment or .env file.")
-        sys.exit(1)
-
-    model = args.model or os.environ.get("OPENROUTER_MODEL")
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
-
-    if args.list:
-        list_issues(repo)
-        return
-
-    if not args.issue:
-        print("[!] No issue number specified. Listing open issues:")
-        list_issues(repo)
-        print("\nUsage: python scripts/auto_fix_pr.py --issue <ISSUE_NUMBER>")
-        return
-
-    print(f"[*] Fetching issue #{args.issue} from repo '{repo or 'current'}'...")
-    issue_data = fetch_issue(args.issue, repo)
+def fix_single_issue(issue_num, repo, api_key, model, target_files=None, dry_run=False):
+    """Execute end-to-end bug fix for a single issue and create PR."""
+    print(f"\n{'=' * 50}")
+    print(f"[*] Fetching issue #{issue_num} from repo '{repo or 'current'}'...")
+    issue_data = fetch_issue(issue_num, repo)
     print(f"[+] Found issue #{issue_data['number']}: {issue_data['title']}")
 
-    # Determine files to inspect
-    target_files = args.files or []
     if not target_files:
         issue_full_text = f"{issue_data.get('title', '')}\n{issue_data.get('body', '')}"
         for comment in issue_data.get("comments", []):
@@ -344,22 +313,18 @@ def main():
         target_files = find_candidate_files(issue_full_text)
 
     if not target_files:
-        print("[!] Could not auto-detect affected files from issue text.")
-        print("Please provide relevant files explicitly with --files <path1> <path2>")
-        sys.exit(1)
+        print(f"[!] Could not auto-detect affected files for issue #{issue_num}. Skipping.")
+        return None
 
     print(f"[+] Target files to inspect: {', '.join(target_files)}")
 
-    # Call AI
     fix_data = plan_and_fix(issue_data, target_files, api_key, model)
 
-    print("\n" + "=" * 50)
     print(f"[*] AI Analysis: {fix_data.get('analysis')}")
     print(f"[*] Suggested Commit: {fix_data.get('commit_message')}")
     print(f"[*] PR Title: {fix_data.get('pr_title')}")
-    print("=" * 50 + "\n")
 
-    if args.dry_run:
+    if dry_run:
         print("[*] Dry run mode enabled. Changes will not be applied to git.")
         for change in fix_data.get("changes", []):
             print(f"\n--- Proposed Diff for {change['path']} ---")
@@ -368,16 +333,12 @@ def main():
             print("=======")
             print(change["replace"].strip())
             print(">>>>>>>")
-        return
+        return None
 
-    # Check git clean state or checkout branch
-    issue_num = issue_data["number"]
     branch_name = f"fix/issue-{issue_num}"
-
     print(f"[*] Creating and switching to branch '{branch_name}'...")
     run_cmd(f"git checkout -b {branch_name}", check=False)
 
-    # Apply changes
     modified_paths = []
     for change in fix_data.get("changes", []):
         fpath = Path(change["path"])
@@ -387,8 +348,8 @@ def main():
             print(f"[+] Applied changes to: {fpath}")
 
     if not modified_paths:
-        print("[!] No files were modified. Aborting PR creation.")
-        sys.exit(1)
+        print(f"[!] No files were modified for issue #{issue_num}. Aborting PR.")
+        return None
 
     # Syntax sanity check for python files
     for p in modified_paths:
@@ -399,8 +360,7 @@ def main():
                 print(f"[✓] Syntax check passed: {p}")
             except Exception as e:
                 print(f"[!] Syntax error in generated code {p}: {e}")
-                print("[!] Aborting commit.")
-                sys.exit(1)
+                return None
 
     # Unit test verification if tests folder exists
     if Path("tests").is_dir():
@@ -437,10 +397,91 @@ def main():
     pr_cmd = f'gh pr create {pr_repo_arg} --title "{pr_title}" --body "{pr_body}"'
     pr_url = run_cmd(pr_cmd)
 
-    print("\n" + "=" * 50)
-    print(f"[🎉 SUCCESS] Pull Request created successfully!")
-    print(f"PR URL: {pr_url}")
-    print("=" * 50)
+    print(f"[🎉 SUCCESS] Pull Request created successfully: {pr_url}")
+    # Switch back to main branch for next iterations
+    run_cmd("git checkout main", check=False)
+    return pr_url
+
+
+def run_cron_batch(repo, api_key, model, max_issues=3):
+    """Scan open issues and automatically fix those without an existing PR."""
+    repo_arg = f"--repo {repo}" if repo else ""
+    print(f"[*] Scanning open issues in {repo or 'current repository'} for cron batch...")
+    cmd = f"gh issue list {repo_arg} --state open --limit 20 --json number,title,labels"
+    raw = run_cmd(cmd)
+    issues = json.loads(raw)
+
+    if not issues:
+        print("[*] No open issues found.")
+        return
+
+    # Check existing open/closed PR branches
+    pr_cmd = f"gh pr list {repo_arg} --state all --limit 50 --json headRefName"
+    existing_prs = json.loads(run_cmd(pr_cmd))
+    existing_branches = {p.get("headRefName") for p in existing_prs}
+
+    processed = 0
+    for issue in issues:
+        num = issue["number"]
+        branch_name = f"fix/issue-{num}"
+        if branch_name in existing_branches:
+            print(f"[*] Issue #{num} already has a corresponding branch/PR '{branch_name}'. Skipping.")
+            continue
+
+        print(f"\n[*] Processing open issue #{num}: {issue['title']}")
+        try:
+            url = fix_single_issue(num, repo, api_key, model)
+            if url:
+                processed += 1
+            if processed >= max_issues:
+                print(f"[*] Reached batch limit of {max_issues} issues for this cron run.")
+                break
+        except Exception as e:
+            print(f"[!] Error processing issue #{num}: {e}")
+
+    print(f"\n[*] Cron batch run finished. Total PRs created: {processed}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Auto-fix GitHub Issues and create PRs using OpenRouter AI")
+    parser.add_argument("--issue", type=int, help="Target Issue number to fix")
+    parser.add_argument("--repo", type=str, help="GitHub repo (e.g. owner/repo). Defaults to GITHUB_REPOSITORY or current repo")
+    parser.add_argument("--files", nargs="*", help="Specific files related to this bug")
+    parser.add_argument("--model", type=str, default=None, help="OpenRouter model (default from env or fallback list)")
+    parser.add_argument("--dry-run", action="store_true", help="Only generate fix without committing or pushing PR")
+    parser.add_argument("--list", action="store_true", help="List open issues in the repository")
+    parser.add_argument("--cron-batch", action="store_true", help="Batch process open issues without existing PRs (ideal for scheduled runs)")
+    parser.add_argument("--max-issues", type=int, default=3, help="Max issues to fix in a cron-batch run (default: 3)")
+    args = parser.parse_args()
+
+    # Load .env
+    root_dir = Path(__file__).resolve().parent.parent
+    load_env(root_dir / ".env")
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        print("[Error] OPENROUTER_API_KEY not found in environment or .env file.")
+        sys.exit(1)
+
+    model = args.model or os.environ.get("OPENROUTER_MODEL")
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
+
+    if args.list:
+        list_issues(repo)
+        return
+
+    if args.cron_batch:
+        run_cron_batch(repo, api_key, model, max_issues=args.max_issues)
+        return
+
+    if not args.issue:
+        print("[!] No issue number specified. Listing open issues:")
+        list_issues(repo)
+        print("\nUsage: python scripts/auto_fix_pr.py --issue <ISSUE_NUMBER>")
+        print("   or: python scripts/auto_fix_pr.py --cron-batch")
+        return
+
+    fix_single_issue(args.issue, repo, api_key, model, target_files=args.files, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
