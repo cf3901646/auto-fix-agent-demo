@@ -7,4 +7,6 @@ def calculate_average(numbers: list[float]) -> float:
     BUG: Crashes with ZeroDivisionError when numbers list is empty!
     Should return 0.0 when numbers is empty.
     """
+    if not numbers:
+        return 0.0
     return sum(numbers) / len(numbers)
