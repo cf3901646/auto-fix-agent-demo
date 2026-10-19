@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import re
+import time
 import argparse
 import subprocess
 import urllib.request
@@ -49,18 +50,20 @@ def get_opener():
 
 
 def run_cmd(cmd, cwd=None, check=True):
-    """Run a shell command and return stdout."""
+    """Run a shell command or argument list and return stdout."""
+    is_str = isinstance(cmd, str)
     res = subprocess.run(
         cmd,
         cwd=cwd,
-        shell=True,
+        shell=is_str,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace"
     )
     if check and res.returncode != 0:
-        raise RuntimeError(f"Command failed (exit {res.returncode}): {cmd}\nStderr: {res.stderr.strip()}")
+        cmd_str = cmd if is_str else " ".join(cmd)
+        raise RuntimeError(f"Command failed (exit {res.returncode}): {cmd_str}\nStderr: {res.stderr.strip()}")
     return res.stdout.strip()
 
 
@@ -150,6 +153,11 @@ def is_actionable_issue(issue, excluded_repos=None):
     title = issue.get("title", "").lower()
     body = (issue.get("body") or "").lower()
     full_text = f"{title}\n{body}"
+
+    # Disqualify educational homework / assignment repos to focus on real open-source libraries
+    assignment_words = ["homework", "assignment", "tutorial", "course", "exercise", "cs1", "cs2", "lab1", "lab2", "lab3"]
+    if any(w in repo_name for w in assignment_words):
+        return False, f"Skipping educational/assignment repository: {repo_name}"
 
     # Disqualify long architectural discussion / policy / question / release notes
     skip_keywords = ["discussion", "roadmap", "rfc", "proposal", "feature request", "policy", "question"]
@@ -269,15 +277,29 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
         # 1. Fork repo to user account if not already forked
         print(f"[*] Ensuring fork exists on account '{my_username}'...")
         try:
-            run_cmd(f"gh repo fork {repo_full_name} --clone=false", check=False)
+            run_cmd(["gh", "repo", "fork", repo_full_name, "--clone=false"], check=False)
+            time.sleep(3)
         except Exception as e:
             print(f"[!] Fork notice: {e}")
 
-        # 2. Clone user's fork or upstream
+        # 2. Clone user's fork with retry
         fork_name = f"{my_username}/{repo_full_name.split('/')[-1]}"
         print(f"[*] Cloning {fork_name} into temporary workspace...")
         clone_url = f"https://x-access-token:{gh_token}@github.com/{fork_name}.git"
-        run_cmd(f"git clone --depth 50 {clone_url} {repo_dir}")
+        cloned = False
+        for attempt in range(4):
+            try:
+                run_cmd(f"git clone --depth 50 {clone_url} {repo_dir}")
+                cloned = True
+                break
+            except Exception as e:
+                if attempt < 3:
+                    print(f"[*] Waiting for fork '{fork_name}' to become ready on GitHub ({attempt + 1}/3)...")
+                    time.sleep(3)
+                else:
+                    print(f"[!] Failed to clone fork {fork_name}: {e}")
+        if not cloned:
+            return False
 
         # Add upstream remote
         run_cmd(f"git remote add upstream https://github.com/{repo_full_name}.git", cwd=repo_dir, check=False)
@@ -391,17 +413,23 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
         if test_dir.is_dir():
             print("[*] Found tests directory. Running test suite...")
             try:
-                run_cmd("python -m unittest discover -s tests -p 'test_*.py'", cwd=repo_dir, check=False)
-                print("[✓] Test suite verification executed.")
+                # Try pytest first if present
+                py_test_cmd = ["python", "-m", "pytest", "tests", "-q"]
+                res = subprocess.run(py_test_cmd, cwd=repo_dir, capture_output=True, text=True)
+                if res.returncode == 0:
+                    print("[✓] pytest test suite executed successfully.")
+                else:
+                    run_cmd("python -m unittest discover -s tests -p 'test_*.py'", cwd=repo_dir, check=False)
+                    print("[✓] unittest verification executed.")
             except Exception as e:
                 print(f"[!] Notice during testing: {e}")
 
         # 8. Git Commit & Push to User's Fork
         commit_msg = parsed.get("commit_message", f"fix: resolve issue #{issue_num}")
         for m in modified:
-            run_cmd(f'git add "{m}"', cwd=repo_dir)
+            run_cmd(["git", "add", m], cwd=repo_dir)
 
-        run_cmd(f'git commit -m "{commit_msg}"', cwd=repo_dir)
+        run_cmd(["git", "commit", "-m", commit_msg], cwd=repo_dir)
         print(f"[+] Committed: {commit_msg}")
 
         if not auto_pr:
@@ -409,14 +437,20 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
             return True
 
         print(f"[*] Pushing branch '{branch_name}' to fork '{fork_name}'...")
-        run_cmd(f"git push -u origin {branch_name}", cwd=repo_dir)
+        run_cmd(["git", "push", "-u", "origin", branch_name], cwd=repo_dir)
 
         # 9. Create PR targeting the original Upstream repository
         pr_title = parsed.get("pr_title", f"fix: resolve issue #{issue_num}")
         pr_body = parsed.get("pr_body", f"Closes #{issue_num}\n\nAutomated fix generated via OpenRouter AI.")
 
         print(f"[*] Submitting Pull Request to {repo_full_name}...")
-        pr_cmd = f'gh pr create --repo {repo_full_name} --head {my_username}:{branch_name} --title "{pr_title}" --body "{pr_body}"'
+        pr_cmd = [
+            "gh", "pr", "create",
+            "--repo", repo_full_name,
+            "--head", f"{my_username}:{branch_name}",
+            "--title", pr_title,
+            "--body", pr_body
+        ]
         pr_url = run_cmd(pr_cmd, cwd=repo_dir)
         print(f"\n[🎉 SUCCESS] Pull Request opened on {repo_full_name}: {pr_url}\n")
         return True
@@ -478,8 +512,26 @@ def main():
             except Exception as e:
                 print(f"[!] Error fetching issues from {r}: {e}")
     else:
-        print("[*] Searching GitHub for open-source issues...")
-        candidates = search_candidate_issues(gh_token, args.query, limit=15)
+        print("[*] Searching GitHub for open-source issues across various projects...")
+        queries = [args.query] if args.query else [
+            'is:open is:issue language:python stars:>50 label:"good first issue"',
+            'is:open is:issue language:python stars:>100 label:bug',
+            'is:open is:issue language:python stars:>50 label:"help wanted"'
+        ]
+        seen_urls = set()
+        for q in queries:
+            print(f"[*] Executing search query: {q}")
+            try:
+                items = search_candidate_issues(gh_token, q, limit=15)
+                for item in items:
+                    u = item.get("html_url") or item.get("url")
+                    if u and u not in seen_urls:
+                        seen_urls.add(u)
+                        candidates.append(item)
+            except Exception as e:
+                print(f"[!] Search query error: {e}")
+            if len(candidates) >= 20:
+                break
 
     print(f"[*] Found {len(candidates)} candidate issues. Filtering for actionable bugs...")
 

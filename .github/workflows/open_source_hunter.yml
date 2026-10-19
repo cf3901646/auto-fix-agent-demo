@@ -2,15 +2,15 @@ name: Open Source Autonomous Bug Hunter
 
 on:
   schedule:
-    # 自动全无人值守定时巡检：每 6 小时自动唤醒一次，扫描开源热门项目
-    - cron: '0 */6 * * *'
+    # 自动全无人值守高频定时巡检：每 30 分钟自动唤醒一次，扫描开源热门项目
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       query:
         description: 'GitHub Search query for issues'
         required: false
         type: string
-        default: 'is:open is:issue label:"good first issue" language:python'
+        default: 'is:open is:issue language:python stars:>30 label:"good first issue"'
       target_repos:
         description: 'Specific target repositories (space separated, e.g. pallets/flask). If empty, uses search query'
         required: false
@@ -42,6 +42,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
 
       - name: Configure Git Author
         run: |
