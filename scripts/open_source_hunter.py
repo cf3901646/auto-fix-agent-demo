@@ -283,6 +283,9 @@ def parse_markdown_response(text, issue_num, issue_title=""):
             if len(lines) > 1:
                 pr_body = "\n".join(lines[1:]).strip()
 
+    if pr_body:
+        pr_body = re.sub(r'#+\s*(?:File|Changes).*$', '', pr_body, flags=re.DOTALL | re.IGNORECASE).strip()
+
     file_sections = re.findall(r'#+\s*File:\s*([^\n]+)\s*\n(.*?)(?=\n#+\s*File:|$)', text, re.DOTALL | re.IGNORECASE)
     for f_path, block in file_sections:
         f_path = f_path.strip().strip("`").strip()
@@ -582,7 +585,7 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
         for m in modified:
             run_cmd(["git", "add", m], cwd=repo_dir)
 
-        run_cmd(["git", "commit", "-m", commit_msg], cwd=repo_dir)
+        run_cmd(["git", "commit", "-s", "-m", commit_msg], cwd=repo_dir)
         print(f"[+] Committed: {commit_msg}")
 
         if not auto_pr:
@@ -594,6 +597,23 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
 
         # 9. Create PR targeting the original Upstream repository
         pr_title = parsed.get("pr_title", f"fix: resolve issue #{issue_num}")
+
+        # Check for repo PR title convention configs (e.g. pr-title-validation-config.json)
+        pr_title_cfg = repo_dir / ".github" / "pr-title-validation-config.json"
+        if pr_title_cfg.is_file():
+            try:
+                cfg_data = json.loads(pr_title_cfg.read_text(encoding="utf-8"))
+                pat = cfg_data.get("CHECKS", {}).get("regexp")
+                if pat and not re.search(pat, pr_title, re.IGNORECASE):
+                    comp_match = re.search(r'^\w+\(([^)]+)\):?\s*(.*)$', pr_title)
+                    if comp_match:
+                        comp, rest = comp_match.group(1).upper(), comp_match.group(2)
+                        cand_title = f"[{comp}] {rest[:1].upper() + rest[1:]}"
+                        if re.search(pat, cand_title, re.IGNORECASE):
+                            pr_title = cand_title
+            except Exception:
+                pass
+
         pr_body = parsed.get("pr_body", "")
         if verify_report and "Verification" in pr_body:
             pr_body += f"\n- Gate Report: {verify_report}"
