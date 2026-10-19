@@ -56,7 +56,7 @@ jobs:
           SEARCH_QUERY: ${{ inputs.query || 'is:open is:issue label:"good first issue" language:python' }}
           TARGET_REPOS: ${{ inputs.target_repos }}
           MAX_PR: ${{ inputs.max_pr || 1 }}
-          AUTO_PR: ${{ inputs.auto_pr }}
+          AUTO_PR: ${{ github.event_name == 'schedule' || inputs.auto_pr }}
         run: |
           ARGS="--max-pr $MAX_PR --exclude haidian open-city-ai"
           if [ "$AUTO_PR" = "true" ]; then
