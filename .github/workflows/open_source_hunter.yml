@@ -53,13 +53,17 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GH_TOKEN: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
+          SEARCH_QUERY: ${{ inputs.query || 'is:open is:issue label:"good first issue" language:python' }}
+          TARGET_REPOS: ${{ inputs.target_repos }}
+          MAX_PR: ${{ inputs.max_pr || 1 }}
+          AUTO_PR: ${{ inputs.auto_pr }}
         run: |
-          QUERY="${{ inputs.query || 'is:open is:issue label:\"good first issue\" language:python' }}"
-          MAX_PR="${{ inputs.max_pr || 1 }}"
-          AUTO_PR_FLAG="${{ inputs.auto_pr != false && '--auto-pr' || '' }}"
-          
-          if [ -n "${{ inputs.target_repos }}" ]; then
-            python scripts/open_source_hunter.py --repos ${{ inputs.target_repos }} --exclude haidian open-city-ai --max-pr $MAX_PR $AUTO_PR_FLAG
+          ARGS="--max-pr $MAX_PR --exclude haidian open-city-ai"
+          if [ "$AUTO_PR" = "true" ]; then
+            ARGS="$ARGS --auto-pr"
+          fi
+          if [ -n "$TARGET_REPOS" ]; then
+            python scripts/open_source_hunter.py --repos $TARGET_REPOS $ARGS
           else
-            python scripts/open_source_hunter.py --query "$QUERY" --exclude haidian open-city-ai --max-pr $MAX_PR $AUTO_PR_FLAG
+            python scripts/open_source_hunter.py --query "$SEARCH_QUERY" $ARGS
           fi
