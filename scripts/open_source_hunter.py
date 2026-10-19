@@ -139,7 +139,16 @@ def search_candidate_issues(token, query, limit=10):
         return data.get("items", [])
 
 
-def is_actionable_issue(issue, excluded_repos=None):
+def get_repo_stars(repo_full_name, gh_token):
+    """Retrieve star count for repository."""
+    try:
+        raw = run_cmd(["gh", "repo", "view", repo_full_name, "--json", "stargazerCount", "--jq", ".stargazerCount"])
+        return int(raw.strip())
+    except Exception:
+        return 0
+
+
+def is_actionable_issue(issue, excluded_repos=None, min_stars=0, gh_token=None):
     """Filter out non-actionable, subjective discussions or excluded repositories."""
     excluded_repos = excluded_repos or []
     repo_url = issue.get("repository_url", "")
@@ -158,6 +167,12 @@ def is_actionable_issue(issue, excluded_repos=None):
     assignment_words = ["homework", "assignment", "tutorial", "course", "exercise", "cs1", "cs2", "lab1", "lab2", "lab3"]
     if any(w in repo_name for w in assignment_words):
         return False, f"Skipping educational/assignment repository: {repo_name}"
+
+    # Enforce minimum stars for target repository
+    if min_stars > 0 and gh_token:
+        stars = get_repo_stars(repo_name, gh_token)
+        if stars < min_stars:
+            return False, f"Repository {repo_name} has {stars} stars (required > {min_stars})"
 
     # Disqualify long architectural discussion / policy / question / release notes
     skip_keywords = ["discussion", "roadmap", "rfc", "proposal", "feature request", "policy", "question"]
@@ -458,7 +473,8 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
 
 def main():
     parser = argparse.ArgumentParser(description="Autonomous Open Source Bug Hunter & PR Bot")
-    parser.add_argument("--query", type=str, default='is:open is:issue label:"good first issue" language:python', help="GitHub Search query")
+    parser.add_argument("--query", type=str, default=None, help="GitHub Search query")
+    parser.add_argument("--min-stars", type=int, default=1000, help="Minimum stars for target open-source repositories (default: 1000)")
     parser.add_argument("--repos", nargs="*", default=[], help="Specific target repositories to monitor (e.g. owner/repo)")
     parser.add_argument("--exclude", nargs="*", default=["haidian", "open-city-ai"], help="Repositories to exclude (e.g. competition repos)")
     parser.add_argument("--max-pr", type=int, default=1, help="Maximum number of PRs to submit in one run (default: 1)")
@@ -493,7 +509,7 @@ def main():
         my_username = "cf3901646"
 
     print(f"[*] Authenticated as GitHub user: {my_username}")
-    print(f"[*] Search Query: {args.query}")
+    print(f"[*] Minimum Repository Stars: {args.min_stars}")
     print(f"[*] Excluded repositories: {args.exclude}")
 
     model = args.model or os.environ.get("OPENROUTER_MODEL") or "cohere/north-mini-code:free"
@@ -512,12 +528,19 @@ def main():
             except Exception as e:
                 print(f"[!] Error fetching issues from {r}: {e}")
     else:
-        print("[*] Searching GitHub for open-source issues across various projects...")
-        queries = [args.query] if args.query else [
-            'is:open is:issue language:python stars:>50 label:"good first issue"',
-            'is:open is:issue language:python stars:>100 label:bug',
-            'is:open is:issue language:python stars:>50 label:"help wanted"'
-        ]
+        min_stars = args.min_stars
+        print(f"[*] Searching GitHub for open-source issues across popular projects (stars > {min_stars})...")
+        if args.query:
+            base_q = args.query
+            if "stars:" not in base_q:
+                base_q = f"{base_q} stars:>{min_stars}"
+            queries = [base_q]
+        else:
+            queries = [
+                f'is:open is:issue language:python stars:>{min_stars} label:"good first issue"',
+                f'is:open is:issue language:python stars:>{min_stars} label:bug',
+                f'is:open is:issue language:python stars:>{min_stars} label:"help wanted"'
+            ]
         seen_urls = set()
         for q in queries:
             print(f"[*] Executing search query: {q}")
@@ -533,11 +556,11 @@ def main():
             if len(candidates) >= 20:
                 break
 
-    print(f"[*] Found {len(candidates)} candidate issues. Filtering for actionable bugs...")
+    print(f"[*] Found {len(candidates)} candidate issues. Filtering for actionable bugs in repositories with > {args.min_stars} stars...")
 
     solved_count = 0
     for issue in candidates:
-        ok, reason = is_actionable_issue(issue, excluded_repos=args.exclude)
+        ok, reason = is_actionable_issue(issue, excluded_repos=args.exclude, min_stars=args.min_stars, gh_token=gh_token)
         repo_name = issue.get("repository_url", "").replace("https://api.github.com/repos/", "")
         num = issue.get("number")
         title = issue.get("title", "")
