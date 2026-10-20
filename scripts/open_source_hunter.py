@@ -121,6 +121,14 @@ def call_openrouter(messages, api_key, model="cohere/north-mini-code:free"):
     raise RuntimeError(f"All OpenRouter models failed. Last error: {last_err}")
 
 
+DISQUALIFIED_ORGS_AND_REPOS = [
+    "pytorch", "tensorflow", "cpython", "python/cpython",
+    "google", "google-research", "facebook", "facebookresearch",
+    "meta", "microsoft", "apple", "canonical", "omnigent", "omnigent-ai",
+    "apache"
+]
+
+
 def search_candidate_issues(token, query, limit=10):
     """Search GitHub for good candidate issues."""
     opener = get_opener()
@@ -139,9 +147,9 @@ def search_candidate_issues(token, query, limit=10):
 
 
 def search_top_repos(token, min_stars=1000, limit=20):
-    """Search for popular, actively updated Python repositories with > min_stars."""
+    """Search for popular, actively updated Python repositories with > min_stars, excluding corporate CLA gates."""
     opener = get_opener()
-    url = f"https://api.github.com/search/repositories?q=language:python+stars:>{min_stars}&sort=updated&order=desc&per_page={limit}"
+    url = f"https://api.github.com/search/repositories?q=language:python+stars:>{min_stars}&sort=updated&order=desc&per_page={limit * 2}"
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "OpenSourceBugHunter"
@@ -152,7 +160,16 @@ def search_top_repos(token, min_stars=1000, limit=20):
     try:
         with opener.open(req) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return [item["full_name"] for item in data.get("items", [])]
+            repos = []
+            for item in data.get("items", []):
+                fn = item.get("full_name", "")
+                fn_lower = fn.lower()
+                if any(disq in fn_lower for disq in DISQUALIFIED_ORGS_AND_REPOS):
+                    continue
+                repos.append(fn)
+                if len(repos) >= limit:
+                    break
+            return repos
     except Exception as e:
         print(f"[!] Error querying top repos: {e}")
         return []
@@ -177,6 +194,18 @@ def is_actionable_issue(issue, excluded_repos=None, min_stars=0, gh_token=None):
     for exc in excluded_repos:
         if exc.lower() in repo_name:
             return False, f"Matches excluded repository pattern: {exc}"
+
+    # Disqualify corporate repositories with strict CLA gates or specialized C buildchains
+    for disq in DISQUALIFIED_ORGS_AND_REPOS:
+        if disq in repo_name:
+            return False, f"Skipping repository with strict CLA or external approval gate: {repo_name}"
+
+    # Check issue labels to avoid non-actionable states
+    labels = [l.get("name", "").lower() for l in issue.get("labels", []) if isinstance(l, dict)]
+    skip_labels = ["wontfix", "invalid", "duplicate", "question", "discussion", "needs repro", "cla", "blocked", "triaged"]
+    for sl in skip_labels:
+        if any(sl in lbl for lbl in labels):
+            return False, f"Issue has disqualifying label: {sl}"
 
     title = issue.get("title", "").lower()
     body = (issue.get("body") or "").lower()
@@ -424,8 +453,67 @@ def verify_patch(repo_dir: Path, modified_files: list) -> tuple[bool, str]:
     return True, summary
 
 
+def extract_candidate_files(repo_dir: Path, issue_title: str, issue_body: str) -> list[str]:
+    """Safely extract valid relative file paths inside repo_dir mentioned in issue."""
+    text = f"{issue_title}\n{issue_body}"
+    allowed_exts = (".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".toml", ".rst", ".md")
+    tokens = re.findall(r'[\w./\-]+\.[a-zA-Z0-9]+', text)
+    
+    candidates = []
+    repo_dir_resolved = repo_dir.resolve()
+    
+    for tok in tokens:
+        if not tok.endswith(allowed_exts):
+            continue
+        if tok.startswith(("http://", "https://", "ftp://")):
+            continue
+            
+        # Clean leading slashes and Windows drive letters to guarantee a relative path
+        clean_tok = tok.lstrip("/\\")
+        if re.match(r'^[a-zA-Z]:', clean_tok):
+            clean_tok = clean_tok[2:].lstrip("/\\")
+            
+        # 1. Direct relative path check
+        try:
+            target_path = (repo_dir / clean_tok).resolve()
+            if repo_dir_resolved in target_path.parents or target_path == repo_dir_resolved:
+                if target_path.is_file() and ".git" not in target_path.parts:
+                    rel_posix = target_path.relative_to(repo_dir_resolved).as_posix()
+                    if rel_posix not in candidates:
+                        candidates.append(rel_posix)
+                        continue
+        except (OSError, PermissionError, ValueError):
+            pass
+
+        # 2. If not direct match, search by filename (skipping overly common/ambiguous names)
+        fname = Path(clean_tok).name
+        if fname in ("__init__.py", "setup.py", "conftest.py", "index.js", "package.json"):
+            continue
+            
+        try:
+            for f in repo_dir.rglob(fname):
+                try:
+                    if f.is_file() and ".git" not in f.parts and "__pycache__" not in f.parts and "node_modules" not in f.parts:
+                        f_resolved = f.resolve()
+                        if repo_dir_resolved in f_resolved.parents:
+                            rel_posix = f_resolved.relative_to(repo_dir_resolved).as_posix()
+                            if rel_posix not in candidates:
+                                candidates.append(rel_posix)
+                                if len(candidates) >= 5:
+                                    break
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            pass
+
+        if len(candidates) >= 5:
+            break
+
+    return candidates[:5]
+
+
 def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username, gh_token, auto_pr=False):
-    """Clone, diagnose, fix, test, and submit PR to upstream repo."""
+    """Clone, diagnose, fix, test, and submit PR to upstream repo with full error shielding."""
     issue_num = issue_data["number"]
     issue_title = issue_data["title"]
     issue_body = issue_data.get("body") or ""
@@ -435,200 +523,208 @@ def solve_issue_in_repo(repo_full_name, issue_data, api_key, model, my_username,
     print(f"[*] Title: {issue_title}")
     print(f"{'=' * 60}")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        repo_dir = Path(tmpdir) / "repo"
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
 
-        # 1. Fork repo to user account if not already forked
-        print(f"[*] Ensuring fork exists on account '{my_username}'...")
-        try:
-            run_cmd(["gh", "repo", "fork", repo_full_name, "--clone=false"], check=False)
-            time.sleep(3)
-        except Exception as e:
-            print(f"[!] Fork notice: {e}")
-
-        # 2. Clone user's fork with retry
-        fork_name = f"{my_username}/{repo_full_name.split('/')[-1]}"
-        print(f"[*] Cloning {fork_name} into temporary workspace...")
-        clone_url = f"https://x-access-token:{gh_token}@github.com/{fork_name}.git"
-        cloned = False
-        for attempt in range(4):
+            # 1. Fork repo to user account if not already forked
+            print(f"[*] Ensuring fork exists on account '{my_username}'...")
             try:
-                run_cmd(f"git clone --depth 50 {clone_url} {repo_dir}")
-                cloned = True
-                break
+                run_cmd(["gh", "repo", "fork", repo_full_name, "--clone=false"], check=False)
+                time.sleep(3)
             except Exception as e:
-                if attempt < 3:
-                    print(f"[*] Waiting for fork '{fork_name}' to become ready on GitHub ({attempt + 1}/3)...")
-                    time.sleep(3)
-                else:
-                    print(f"[!] Failed to clone fork {fork_name}: {e}")
-        if not cloned:
-            return False
+                print(f"[!] Fork notice: {e}")
 
-        # Add upstream remote
-        run_cmd(f"git remote add upstream https://github.com/{repo_full_name}.git", cwd=repo_dir, check=False)
-        run_cmd("git fetch upstream", cwd=repo_dir, check=False)
+            # 2. Clone user's fork with retry
+            fork_name = f"{my_username}/{repo_full_name.split('/')[-1]}"
+            print(f"[*] Cloning {fork_name} into temporary workspace...")
+            clone_url = f"https://x-access-token:{gh_token}@github.com/{fork_name}.git"
+            cloned = False
+            for attempt in range(4):
+                try:
+                    run_cmd(f"git clone --depth 50 {clone_url} {repo_dir}")
+                    cloned = True
+                    break
+                except Exception as e:
+                    if attempt < 3:
+                        print(f"[*] Waiting for fork '{fork_name}' to become ready on GitHub ({attempt + 1}/3)...")
+                        time.sleep(3)
+                    else:
+                        print(f"[!] Failed to clone fork {fork_name}: {e}")
+            if not cloned:
+                return False
 
-        # 3. Create branch
-        branch_name = f"fix/issue-{issue_num}-auto"
-        run_cmd(f"git checkout -b {branch_name}", cwd=repo_dir)
+            # Add upstream remote
+            run_cmd(f"git remote add upstream https://github.com/{repo_full_name}.git", cwd=repo_dir, check=False)
+            run_cmd("git fetch upstream", cwd=repo_dir, check=False)
 
-        # 4. Search candidate files mentioned in issue
-        text = f"{issue_title}\n{issue_body}"
-        matches = re.findall(r'[\w./\-]+\.[a-zA-Z0-9]+', text)
-        candidate_files = []
-        for m in matches:
-            fp = Path(repo_dir) / m
-            if fp.is_file() and not m.startswith(".git"):
-                candidate_files.append(str(Path(m).as_posix()))
-            else:
-                found = list(repo_dir.glob(f"**/{Path(m).name}"))
-                for f in found:
-                    if ".git" not in f.parts and "__pycache__" not in f.parts:
-                        rel = str(f.relative_to(repo_dir).as_posix())
-                        if rel not in candidate_files:
-                            candidate_files.append(rel)
+            # 3. Create branch
+            branch_name = f"fix/issue-{issue_num}-auto"
+            run_cmd(f"git checkout -b {branch_name}", cwd=repo_dir)
 
-        candidate_files = candidate_files[:5]
-        if not candidate_files:
-            print(f"[!] Could not locate relevant source files for issue #{issue_num}. Aborting.")
-            return False
+            # 4. Search candidate files mentioned in issue
+            candidate_files = extract_candidate_files(repo_dir, issue_title, issue_body)
+            if not candidate_files:
+                print(f"[!] Could not locate relevant source files for issue #{issue_num}. Aborting.")
+                return False
 
-        print(f"[+] Found candidate source files: {', '.join(candidate_files)}")
+            print(f"[+] Found candidate source files: {', '.join(candidate_files)}")
 
-        # 5. Build context & prompt
-        files_context = []
-        for cf in candidate_files:
-            cfp = repo_dir / cf
-            if cfp.is_file():
-                content = cfp.read_text(encoding="utf-8", errors="replace")
-                if len(content) > 25000:
-                    content = content[:25000] + "\n\n... [Content truncated] ..."
-                files_context.append(f"### File: {cf}\n```python\n{content}\n```")
+            # 5. Build context & prompt
+            files_context = []
+            for cf in candidate_files:
+                cfp = repo_dir / cf
+                try:
+                    if cfp.is_file():
+                        content = cfp.read_text(encoding="utf-8", errors="replace")
+                        if len(content) > 25000:
+                            content = content[:25000] + "\n\n... [Content truncated] ..."
+                        files_context.append(f"### File: {cf}\n```python\n{content}\n```")
+                except Exception as e:
+                    print(f"[!] Could not read candidate file {cf}: {e}")
 
-        files_str = "\n\n".join(files_context)
+            if not files_context:
+                print(f"[!] No readable candidate files found for issue #{issue_num}. Aborting.")
+                return False
 
-        system_prompt = (
-            "You are a principal open-source software engineer contributing to high-profile repositories.\n"
-            "Your task is to analyze the issue report, inspect the provided file contents, fix the bug cleanly, and provide a search-and-replace diff.\n"
-            "Follow these strict engineering principles:\n"
-            "1. Concurrency & Async: If modifying asynchronous code or event handling, ensure execution order and FIFO queuing are preserved.\n"
-            "2. Minimal & Focused: Keep changes minimal and surgically focused. Do NOT add unnecessary abstractions, refactors, or noise.\n"
-            "3. Conventions: Respect existing code conventions, typing, and formatting.\n\n"
-            "Output MUST follow this EXACT structure:\n\n"
-            "# Analysis\n"
-            "<Detailed explanation of root cause and fix strategy>\n\n"
-            "# Commit\n"
-            "fix(scope): concise conventional commit message\n\n"
-            "# PR Title\n"
-            "fix(scope): clear and informative pull request title\n\n"
-            "# PR Body\n"
-            "## Summary of Changes\n"
-            "<Explain what was broken and how this patch fixes it>\n\n"
-            "## Motivation & Context\n"
-            "Closes #<number>\n\n"
-            "## Verification\n"
-            "<How this change can be verified>\n\n"
-            "# Changes\n"
-            "### File: <relative/file/path>\n"
-            "<<<<<<< SEARCH\n"
-            "<exact lines in original file to be replaced>\n"
-            "=======\n"
-            "<new replacement lines>\n"
-            ">>>>>>>\n"
-        )
+            files_str = "\n\n".join(files_context)
 
-        user_prompt = (
-            f"Repository: {repo_full_name}\n"
-            f"Issue #{issue_num}: {issue_title}\n\n"
-            f"Issue Description:\n{issue_body}\n\n"
-            f"Files to inspect:\n{files_str}\n\n"
-            "Please provide your analysis and SEARCH/REPLACE diff now."
-        )
+            system_prompt = (
+                "You are a principal open-source software engineer contributing to high-profile repositories.\n"
+                "Your task is to analyze the issue report, inspect the provided file contents, fix the bug cleanly, and provide a search-and-replace diff.\n"
+                "Follow these strict engineering principles:\n"
+                "1. Concurrency & Async: If modifying asynchronous code or event handling, ensure execution order and FIFO queuing are preserved.\n"
+                "2. Minimal & Focused: Keep changes minimal and surgically focused. Do NOT add unnecessary abstractions, refactors, or noise.\n"
+                "3. Conventions: Respect existing code conventions, typing, and formatting.\n\n"
+                "Output MUST follow this EXACT structure:\n\n"
+                "# Analysis\n"
+                "<Detailed explanation of root cause and fix strategy>\n\n"
+                "# Commit\n"
+                "fix(scope): concise conventional commit message\n\n"
+                "# PR Title\n"
+                "fix(scope): clear and informative pull request title\n\n"
+                "# PR Body\n"
+                "## Summary of Changes\n"
+                "<Explain what was broken and how this patch fixes it>\n\n"
+                "## Motivation & Context\n"
+                "Closes #<number>\n\n"
+                "## Verification\n"
+                "<How this change can be verified>\n\n"
+                "# Changes\n"
+                "### File: <relative/file/path>\n"
+                "<<<<<<< SEARCH\n"
+                "<exact lines in original file to be replaced>\n"
+                "=======\n"
+                "<new replacement lines>\n"
+                ">>>>>>>\n"
+            )
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
+            user_prompt = (
+                f"Repository: {repo_full_name}\n"
+                f"Issue #{issue_num}: {issue_title}\n\n"
+                f"Issue Description:\n{issue_body}\n\n"
+                f"Files to inspect:\n{files_str}\n\n"
+                "Please provide your analysis and SEARCH/REPLACE diff now."
+            )
 
-        print(f"[*] Calling OpenRouter AI to formulate fix...")
-        response_text = call_openrouter(messages, api_key, model)
-        parsed = parse_markdown_response(response_text, issue_num, issue_title)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
 
-        if not parsed["changes"]:
-            print("[!] AI did not produce valid search-and-replace changes. Aborting.")
-            return False
-
-        # 6. Apply changes
-        modified = []
-        for change in parsed["changes"]:
-            fpath = repo_dir / change["path"]
-            ok = apply_search_replace(fpath, change["search"], change["replace"])
-            if ok:
-                modified.append(change["path"])
-                print(f"[+] Successfully patched: {change['path']}")
-
-        if not modified:
-            print("[!] Search blocks could not be matched in original files. Aborting.")
-            return False
-
-        # 7. Multi-language Verification Gate
-        print("[*] Running Multi-language Verification Gate (syntax and unit tests)...")
-        ok, verify_report = verify_patch(repo_dir, modified)
-        if not ok:
-            print(f"[!] Verification Gate FAILED: {verify_report}. Discarding patch.")
-            return False
-        print(f"[✓] Verification Gate PASSED: {verify_report}")
-
-        # 8. Git Commit & Push to User's Fork
-        commit_msg = parsed.get("commit_message") or parsed.get("pr_title") or f"fix: resolve issue #{issue_num}"
-        for m in modified:
-            run_cmd(["git", "add", m], cwd=repo_dir)
-
-        run_cmd(["git", "commit", "-s", "-m", commit_msg], cwd=repo_dir)
-        print(f"[+] Committed: {commit_msg}")
-
-        if not auto_pr:
-            print("[*] Dry-run complete. Patch successfully generated and committed locally.")
-            return True
-
-        print(f"[*] Pushing branch '{branch_name}' to fork '{fork_name}'...")
-        run_cmd(["git", "push", "-u", "origin", branch_name], cwd=repo_dir)
-
-        # 9. Create PR targeting the original Upstream repository
-        pr_title = parsed.get("pr_title", f"fix: resolve issue #{issue_num}")
-
-        # Check for repo PR title convention configs (e.g. pr-title-validation-config.json)
-        pr_title_cfg = repo_dir / ".github" / "pr-title-validation-config.json"
-        if pr_title_cfg.is_file():
+            print(f"[*] Calling OpenRouter AI to formulate fix...")
             try:
-                cfg_data = json.loads(pr_title_cfg.read_text(encoding="utf-8"))
-                pat = cfg_data.get("CHECKS", {}).get("regexp")
-                if pat and not re.search(pat, pr_title, re.IGNORECASE):
-                    comp_match = re.search(r'^\w+\(([^)]+)\):?\s*(.*)$', pr_title)
-                    if comp_match:
-                        comp, rest = comp_match.group(1).upper(), comp_match.group(2)
-                        cand_title = f"[{comp}] {rest[:1].upper() + rest[1:]}"
-                        if re.search(pat, cand_title, re.IGNORECASE):
-                            pr_title = cand_title
-            except Exception:
-                pass
+                response_text = call_openrouter(messages, api_key, model)
+            except Exception as e:
+                print(f"[!] OpenRouter AI generation failed: {e}")
+                return False
 
-        pr_body = parsed.get("pr_body", "")
-        if verify_report and "Verification" in pr_body:
-            pr_body += f"\n- Gate Report: {verify_report}"
+            parsed = parse_markdown_response(response_text, issue_num, issue_title)
 
-        print(f"[*] Submitting Pull Request to {repo_full_name}...")
-        pr_cmd = [
-            "gh", "pr", "create",
-            "--repo", repo_full_name,
-            "--head", f"{my_username}:{branch_name}",
-            "--title", pr_title,
-            "--body", pr_body
-        ]
-        pr_url = run_cmd(pr_cmd, cwd=repo_dir)
-        print(f"\n[🎉 SUCCESS] Pull Request opened on {repo_full_name}: {pr_url}\n")
-        return True
+            if not parsed["changes"]:
+                print("[!] AI did not produce valid search-and-replace changes. Aborting.")
+                return False
+
+            # 6. Apply changes
+            modified = []
+            for change in parsed["changes"]:
+                fpath = repo_dir / change["path"]
+                ok = apply_search_replace(fpath, change["search"], change["replace"])
+                if ok:
+                    modified.append(change["path"])
+                    print(f"[+] Successfully patched: {change['path']}")
+
+            if not modified:
+                print("[!] Search blocks could not be matched in original files. Aborting.")
+                return False
+
+            # 7. Multi-language Verification Gate
+            print("[*] Running Multi-language Verification Gate (syntax and unit tests)...")
+            ok, verify_report = verify_patch(repo_dir, modified)
+            if not ok:
+                print(f"[!] Verification Gate FAILED: {verify_report}. Discarding patch.")
+                return False
+            print(f"[✓] Verification Gate PASSED: {verify_report}")
+
+            # 8. Git Commit & Push to User's Fork
+            commit_msg = parsed.get("commit_message") or parsed.get("pr_title") or f"fix: resolve issue #{issue_num}"
+            for m in modified:
+                run_cmd(["git", "add", m], cwd=repo_dir)
+
+            run_cmd(["git", "commit", "-s", "-m", commit_msg], cwd=repo_dir)
+            print(f"[+] Committed: {commit_msg}")
+
+            if not auto_pr:
+                print("[*] Dry-run complete. Patch successfully generated and committed locally.")
+                return True
+
+            print(f"[*] Pushing branch '{branch_name}' to fork '{fork_name}'...")
+            run_cmd(["git", "push", "-u", "origin", branch_name], cwd=repo_dir)
+
+            # 9. Create PR targeting the original Upstream repository
+            pr_title = parsed.get("pr_title", f"fix: resolve issue #{issue_num}")
+
+            # Check for repo PR title convention configs (e.g. pr-title-validation-config.json)
+            pr_title_cfg = repo_dir / ".github" / "pr-title-validation-config.json"
+            if pr_title_cfg.is_file():
+                try:
+                    cfg_data = json.loads(pr_title_cfg.read_text(encoding="utf-8"))
+                    pat = cfg_data.get("CHECKS", {}).get("regexp")
+                    if pat and not re.search(pat, pr_title, re.IGNORECASE):
+                        comp_match = re.search(r'^\w+\(([^)]+)\):?\s*(.*)$', pr_title)
+                        if comp_match:
+                            comp, rest = comp_match.group(1).upper(), comp_match.group(2)
+                            cand_title = f"[{comp}] {rest[:1].upper() + rest[1:]}"
+                            if re.search(pat, cand_title, re.IGNORECASE):
+                                pr_title = cand_title
+                except Exception:
+                    pass
+
+            pr_body = parsed.get("pr_body", "")
+            if verify_report and "Verification" in pr_body:
+                pr_body += f"\n- Gate Report: {verify_report}"
+
+            print(f"[*] Submitting Pull Request to {repo_full_name}...")
+            pr_cmd = [
+                "gh", "pr", "create",
+                "--repo", repo_full_name,
+                "--head", f"{my_username}:{branch_name}",
+                "--title", pr_title,
+                "--body", pr_body
+            ]
+            try:
+                pr_url = run_cmd(pr_cmd, cwd=repo_dir)
+                print(f"\n[🎉 SUCCESS] Pull Request opened on {repo_full_name}: {pr_url}\n")
+                return True
+            except Exception as e:
+                print(f"[!] Error creating Pull Request on {repo_full_name}: {e}")
+                return False
+
+    except Exception as e:
+        print(f"[!] Unexpected error in solve_issue_in_repo for {repo_full_name} #{issue_num}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def main():
@@ -692,8 +788,11 @@ def main():
         print(f"[*] Discovering active open-source repositories with stars > {min_stars}...")
         top_repos = search_top_repos(gh_token, min_stars=min_stars, limit=20)
         curated = [
-            "deepset-ai/haystack", "pallets/werkzeug", "encode/httpx", "pallets/flask",
-            "pydantic/pydantic", "tiangolo/fastapi", "urllib3/urllib3", "bottlepy/bottle"
+            "pallets/werkzeug", "encode/httpx", "pallets/flask", "pydantic/pydantic",
+            "psf/requests", "bottlepy/bottle", "marshmallow-code/marshmallow",
+            "Textualize/rich", "pytest-dev/pytest", "tiangolo/sqlmodel", "tqdm/tqdm",
+            "sqlfluff/sqlfluff", "aio-libs/aiohttp", "samuelcolvin/watchfiles",
+            "urllib3/urllib3", "PDFMathTranslate/PDFMathTranslate"
         ]
         target_pool = list(dict.fromkeys(top_repos + curated))
         print(f"[*] Monitoring repository pool ({len(target_pool)} repos): {', '.join(target_pool[:6])}...")
@@ -730,21 +829,27 @@ def main():
             print(f"[-] Skipping [{repo_name}] #{num} ({reason}): {title[:50]}")
             continue
 
-        print(f"[+] Selected actionable issue: [{repo_name}] #{num} - {title}")
-        success = solve_issue_in_repo(
-            repo_full_name=repo_name,
-            issue_data=issue,
-            api_key=api_key,
-            model=model,
-            my_username=my_username,
-            gh_token=gh_token,
-            auto_pr=args.auto_pr
-        )
-        if success:
-            solved_count += 1
-            if solved_count >= args.max_pr:
-                print(f"[*] Reached max PR limit of {args.max_pr}. Stopping this cycle.")
-                break
+        try:
+            print(f"[+] Selected actionable issue: [{repo_name}] #{num} - {title}")
+            success = solve_issue_in_repo(
+                repo_full_name=repo_name,
+                issue_data=issue,
+                api_key=api_key,
+                model=model,
+                my_username=my_username,
+                gh_token=gh_token,
+                auto_pr=args.auto_pr
+            )
+            if success:
+                solved_count += 1
+                if solved_count >= args.max_pr:
+                    print(f"[*] Reached max PR limit of {args.max_pr}. Stopping this cycle.")
+                    break
+        except Exception as e:
+            print(f"[!] Warning: Exception during solve_issue_in_repo on [{repo_name}] #{num}: {e}")
+            import traceback
+            traceback.print_exc()
+            print("[*] Continuing safely to next candidate...")
 
     print(f"\n[*] Open source bug hunter cycle finished. PRs generated: {solved_count}")
 
