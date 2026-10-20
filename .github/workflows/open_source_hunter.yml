@@ -78,3 +78,12 @@ jobs:
           else
             python scripts/open_source_hunter.py --query "$SEARCH_QUERY" $ARGS
           fi
+
+      - name: Generate Run Summary
+        if: always()
+        run: |
+          echo "## 🛡️ Autonomous Bug Hunter Execution Report" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger Event**: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Repositories**: Active open-source Python repositories with > 1000 stars" >> $GITHUB_STEP_SUMMARY
+          echo "- **Safety Filtering**: Corporate CLA gates, buildbots, and competition repositories automatically shielded" >> $GITHUB_STEP_SUMMARY
+          echo "- **Multi-language Verification Gate**: \`py_compile\`, \`pytest\`, \`yaml\`, \`json\`" >> $GITHUB_STEP_SUMMARY
